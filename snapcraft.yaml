@@ -1,0 +1,92 @@
+# SPDX-FileCopyrightText: 2022 Alexander Langanke
+# SPDX-FileCopyrightText: 2022 James R. Barlow
+# SPDX-FileCopyrightText: 2023 林博仁(Buo-ren, Lin) <Buo.Ren.Lin@gmail.com>
+# SPDX-License-Identifier: MPL-2.0
+
+name: ocrmypdf
+title: OCRmyPDF
+base: core26
+adopt-info: ocrmypdf
+summary: OCRmyPDF adds a searchable text layer to scanned PDF files
+description: |
+  OCRmyPDF adds an optical character recognition (OCR) text layer to scanned
+  PDF files, allowing them to be searched or copy-pasted.
+
+  This snap bundles Tesseract with all language packs, Ghostscript, jbig2enc,
+  pngquant and unpaper.
+
+  Because the snap is strictly confined, it can only access files in your home
+  folder and on removable media. For other locations, use stdin and stdout:
+
+      snap run ocrmypdf - - <input.pdf >output.pdf
+grade: stable
+confinement: strict
+icon: docs/images/logo-square-256.svg
+license: MPL-2.0
+website: https://ocrmypdf.readthedocs.io/
+source-code: https://github.com/ocrmypdf/OCRmyPDF
+issues: https://github.com/ocrmypdf/OCRmyPDF/issues
+
+platforms:
+  amd64:
+
+apps:
+  ocrmypdf:
+    # Run the venv interpreter explicitly: snapd puts $SNAP/usr/bin ahead of
+    # $SNAP/bin on PATH, so a `#!/usr/bin/env python3` launcher would pick up
+    # the bare interpreter without the venv's site-packages.
+    command: bin/python3 -m ocrmypdf
+    environment:
+      TESSDATA_PREFIX: $SNAP/usr/share/tesseract-ocr/5/tessdata
+      GS_LIB: $SNAP/usr/share/ghostscript/current/Resource/Init
+      GS_FONTPATH: $SNAP/usr/share/ghostscript/current/Resource/Font
+    plugs:
+      - home
+      - removable-media
+      - shm
+
+plugs:
+  # A private /dev/shm lets Python multiprocessing create semaphores under
+  # strict confinement.
+  shm:
+    interface: shared-memory
+    private: true
+
+parts:
+  ocrmypdf:
+    plugin: python
+    source: .
+    build-packages:
+      - git
+    stage-packages:
+      - libpython3.14-minimal
+      - libpython3.14-stdlib
+      - python3-minimal
+      - python3.14-minimal
+      - python3.14-venv
+      - ghostscript
+      - icc-profiles-free
+      - jbig2
+      - pngquant
+      - tesseract-ocr-all
+      - unpaper
+    override-pull: |
+      craftctl default
+      # Tagged commits get the bare release version; anything else gets
+      # <last tag>+git<commits since>.<hash>, as with `version: git`.
+      desc=$(git -C "$CRAFT_PROJECT_DIR" -c safe.directory='*' describe --tags --long --match 'v*')
+      tag=${desc%-*-g*}
+      rest=${desc#"$tag"-}
+      count=${rest%-g*}
+      hash=${rest#*-g}
+      if [ "$count" = 0 ]; then
+        craftctl set version="${tag#v}"
+      else
+        craftctl set version="${tag#v}+git${count}.${hash}"
+      fi
+    override-prime: |
+      craftctl default
+      # Ghostscript's resource directory is versioned; give the environment
+      # above a stable path so it survives Ghostscript package updates.
+      gsdir=$(cd usr/share/ghostscript && ls -d [0-9]* | sort -V | tail -n1)
+      ln -sfn "$gsdir" usr/share/ghostscript/current

@@ -1,0 +1,962 @@
+# SPDX-FileCopyrightText: 2022 James R. Barlow
+# SPDX-License-Identifier: MPL-2.0
+
+"""Post-processing image optimization of OCR PDFs.
+
+This module concerns itself only with recoding image data in ways that a PDF
+writer will not do on its own: quantizing PNGs, re-encoding JPEGs, and
+converting bitonal images to JBIG2. Plain stream compression is deliberately
+left to :meth:`pikepdf.Pdf.save`, which OCRmyPDF always calls with
+``compress_streams=True``. Verified against pikepdf 10.11 / qpdf 12.3, saving
+that way will:
+
+- Flate-compress a stream that has no ``/Filter`` at all.
+- Re-encode ``/LZWDecode`` and ``/ASCIIHexDecode`` as ``/FlateDecode``.
+
+The exception is ``/RunLengthDecode``, which qpdf treats as an image filter
+rather than a general-purpose one and leaves alone at the decode levels
+OCRmyPDF uses (the default, and ``generalized`` for PDF/A-1). It would be
+converted at ``StreamDecodeLevel.specialized`` or above.
+
+This matters when driving this module directly rather than through the OCR
+pipeline - see :func:`main` - because the saving step is what performs that
+part of the optimization.
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+import tempfile
+import threading
+from collections.abc import Callable, Iterator, MutableSet, Sequence
+from os import fspath
+from pathlib import Path
+from struct import pack as struct_pack
+from typing import Any, NamedTuple, NewType, cast
+from zlib import compress, crc32
+
+import img2pdf
+from pikepdf import (
+    Array,
+    Dictionary,
+    Name,
+    NamePath,
+    Object,
+    ObjectStreamMode,
+    Pdf,
+    PdfError,
+    PdfImage,
+    Stream,
+    UnsupportedImageTypeError,
+    as_decimal,
+    as_int,
+)
+from pikepdf.models.image import HifiPrintImageNotTranscodableError
+from PIL import Image
+
+from ocrmypdf._concurrent import Executor, SerialExecutor
+from ocrmypdf._exec import ghostscript, jbig2enc, pngquant
+from ocrmypdf._jobcontext import PdfContext
+from ocrmypdf._progressbar import ProgressBar
+from ocrmypdf.exceptions import OutputFileAccessError
+from ocrmypdf.helpers import (
+    IMG2PDF_KWARGS,
+    RESOURCES_XOBJECT,
+    safe_symlink,
+)
+
+log = logging.getLogger(__name__)
+
+#: An image's soft mask carries a pre-blending matte, which rules the image
+#: out of optimization (gh #1536).
+SMASK_MATTE = NamePath.SMask.Matte
+
+DEFAULT_JPEG_QUALITY = 75
+DEFAULT_PNG_QUALITY = 70
+FLATE_JPEG_THRESHOLD = 10000
+
+
+Xref = NewType('Xref', int)
+
+
+class XrefExt(NamedTuple):
+    """A PDF xref and image extension pair."""
+
+    xref: Xref
+    ext: str
+
+
+def img_name(root: Path, xref: Xref, ext: str) -> Path:
+    """Return the name of an image file for a given xref and extension."""
+    return root / f'{xref:08d}{ext}'
+
+
+def png_name(root: Path, xref: Xref) -> Path:
+    """Return the name of a PNG file for a given xref."""
+    return img_name(root, xref, '.png')
+
+
+def jpg_name(root: Path, xref: Xref) -> Path:
+    """Return the name of a JPEG file for a given xref."""
+    return img_name(root, xref, '.jpg')
+
+
+def _filter_parameter(decode_parms: Any, key: Name, default: int) -> int | None:
+    """Read an integer parameter of a stream filter, or None if it is unknown.
+
+    ISO 32000-2 types each filter parameter read here as an integer. Missing
+    decode parameters, a null in a /DecodeParms array, and a missing or null
+    entry all mean the filter uses the default (7.3.8.2, 7.3.9). The standard
+    defines no meaning for a value of any other type, so the encoding is
+    unknown; callers leave such images alone. A Real that spells an integer
+    is taken as that integer, but a fractional one is not truncated, since
+    truncation can change the sign that /K depends on.
+    """
+    if decode_parms is None:
+        return default
+    if not isinstance(decode_parms, Dictionary | dict):
+        return None
+    value = decode_parms.get(key)
+    if value is None:
+        return default
+    if (integer := as_int(value)) is not None:
+        return integer
+    real = as_decimal(value)
+    if real is not None and real == real.to_integral_value():
+        return int(real)
+    return None
+
+
+def extract_image_filter(
+    image: Stream, xref: Xref
+) -> tuple[PdfImage, tuple[Name, Object]] | None:
+    """Determine if an image is extractable."""
+    if image.get(Name.Subtype) != Name.Image:
+        return None
+    # A malformed PDF may omit these or store them as the wrong type, in which
+    # case get_int yields 0 and the image is skipped.
+    if image.get_int(Name.Length, 0, coerce=True) < 100:
+        log.debug(f"xref {xref}: skipping image with small stream size")
+        return None
+    if (
+        image.get_int(Name.Width, 0, coerce=True) < 8
+        or image.get_int(Name.Height, 0, coerce=True) < 8
+    ):  # Issue 732
+        log.debug(f"xref {xref}: skipping image with unusually small dimensions")
+        return None
+
+    pim = PdfImage(image)
+
+    if not pim.filter_decodeparms:
+        # An uncompressed image. There is no filter to reason about, and no need
+        # to build one: saving the PDF with compress_streams=True Flate-encodes
+        # any stream that lacks a filter. See the module docstring.
+        log.debug(f"xref {xref}: skipping image with no compression filter")
+        return None
+
+    if len(pim.filter_decodeparms) > 1:
+        first_filtdp = pim.filter_decodeparms[0]
+        second_filtdp = pim.filter_decodeparms[1]
+        if (
+            len(pim.filter_decodeparms) == 2
+            and first_filtdp[0] == Name.FlateDecode
+            and _filter_parameter(first_filtdp[1], Name.Predictor, 1) == 1
+            and second_filtdp[0] == Name.DCTDecode
+            and not second_filtdp[1]
+        ):
+            log.debug(
+                f"xref {xref}: found image compressed as /FlateDecode /DCTDecode, "
+                "marked for JPEG optimization"
+            )
+            filtdp = pim.filter_decodeparms[1]
+        else:
+            log.debug(f"xref {xref}: skipping image with multiple compression filters")
+            return None
+    else:
+        filtdp = pim.filter_decodeparms[0]
+
+    if pim.bits_per_component > 8:
+        log.debug(f"xref {xref}: skipping wide gamut image")
+        return None  # Don't mess with wide gamut images
+
+    if filtdp[0] == Name.JPXDecode:
+        log.debug(f"xref {xref}: skipping JPEG2000 image")
+        return None  # Don't do JPEG2000
+
+    if filtdp[0] == Name.CCITTFaxDecode:
+        k = _filter_parameter(filtdp[1], Name.K, 0)
+        if k is None:
+            log.debug(f"xref {xref}: skipping CCITT image with malformed /K")
+            return None
+        if k >= 0:
+            log.debug(f"xref {xref}: skipping CCITT Group 3 image")
+            return None  # pikepdf doesn't support Group 3 yet
+
+    if Name.Decode in image:
+        log.debug(f"xref {xref}: skipping image with Decode table")
+        return None  # Don't mess with custom Decode tables
+    if image.get(SMASK_MATTE) is not None:
+        # https://github.com/ocrmypdf/OCRmyPDF/issues/1536
+        # Do not attempt to optimize images that have a SMask with a Matte.
+        # That means alpha channel pre-blending is used, and we're not prepared
+        # to deal with the complexities of that.
+        log.debug(f"xref {xref}: skipping image whose SMask has Matte")
+        return None
+
+    return pim, filtdp
+
+
+def extract_image_jbig2(
+    *, pdf: Pdf, root: Path, image: Stream, xref: Xref, options
+) -> XrefExt | None:
+    """Extract an image, saving it as a JBIG2 file."""
+    del options  # unused arg
+
+    result = extract_image_filter(image, xref)
+    if result is None:
+        return None
+    pim, filtdp = result
+
+    if (
+        pim.bits_per_component == 1
+        and filtdp[0] != Name.JBIG2Decode
+        and jbig2enc.available()
+    ):
+        # Save any colorspace associated with the image, so that we
+        # will export a pure 1-bit PNG with no palette or ICC profile.
+        # Showing the palette or ICC to jbig2enc will cause it to perform
+        # colorspace transform to 1bpp, which will conflict the palette or
+        # ICC if it exists.
+        colorspace = pim.obj.get(Name.ColorSpace, None)
+        if colorspace is not None or pim.image_mask:
+            try:
+                # Set to DeviceGray temporarily; we already in 1 bpc.
+                pim.obj.ColorSpace = Name.DeviceGray
+                imgname = root / f'{xref:08d}'
+                with imgname.open('wb') as f:
+                    ext = pim.extract_to(stream=f)
+                # Rename the file so it has .prejbig2.ext extension
+                # Making it unique avoids problems with Windows if the
+                # same image is extracted multiple times
+                imgname.rename(imgname.with_suffix(".prejbig2" + ext))
+            except NotImplementedError as e:
+                if '/Decode' in str(e):
+                    log.debug(
+                        f"xref {xref}: skipping image with unsupported Decode table"
+                    )
+                    return None
+                raise
+            except UnsupportedImageTypeError:
+                return None
+            finally:
+                # Restore image colorspace after temporarily setting it to DeviceGray
+                if colorspace is not None:
+                    pim.obj.ColorSpace = colorspace
+                else:
+                    del pim.obj.ColorSpace
+            return XrefExt(xref, ".prejbig2" + ext)
+    return None
+
+
+# PNG colour types, and the component count each implies, for the PDF
+# colorspaces that map onto them directly. PNG has no notion of calibration, and
+# neither does the Pillow path we are replacing, so /CalRGB and /CalGray are
+# treated as their device equivalents.
+_PNG_COLOR_TYPE_GRAY = 0
+_PNG_COLOR_TYPE_RGB = 2
+_PNG_COLOR_TYPES: dict[str, tuple[int, int]] = {
+    '/DeviceGray': (_PNG_COLOR_TYPE_GRAY, 1),
+    '/CalGray': (_PNG_COLOR_TYPE_GRAY, 1),
+    '/DeviceRGB': (_PNG_COLOR_TYPE_RGB, 3),
+    '/CalRGB': (_PNG_COLOR_TYPE_RGB, 3),
+}
+
+# Bit depths each PNG colour type permits. Greyscale accepts sub-byte depths;
+# truecolour does not.
+_PNG_BIT_DEPTHS: dict[int, frozenset[int]] = {
+    _PNG_COLOR_TYPE_GRAY: frozenset({1, 2, 4, 8, 16}),
+    _PNG_COLOR_TYPE_RGB: frozenset({8, 16}),
+}
+
+
+def _png_chunk(tag: bytes, data: bytes) -> bytes:
+    """Frame one PNG chunk: length, type, payload, CRC of type and payload."""
+    return (
+        struct_pack('>I', len(data)) + tag + data + struct_pack('>I', crc32(tag + data))
+    )
+
+
+def png_from_flate_predictor(pim: PdfImage, image: Stream) -> bytes | None:
+    """Repackage a Flate-compressed image as PNG without recoding the pixels.
+
+    PDF predictors 10 to 15 are the PNG filtering algorithm, so an image stored
+    as ``/FlateDecode`` with one of them already holds precisely what a PNG
+    ``IDAT`` chunk holds: zlib-compressed scanlines, each prefixed by its filter
+    type byte. Such an image becomes a PNG by wrapping the stream in a header
+    and trailer, skipping the inflate, unfilter, refilter and deflate that
+    decoding to a Pillow image and saving it would perform. On a large image
+    that round trip costs seconds.
+
+    Returns None if the image is not in a directly repackageable form, in which
+    case the caller must fall back to decoding it.
+    """
+    if len(pim.filter_decodeparms) != 1:
+        return None  # Cascaded filters: the Flate layer is not the pixel data
+    filter_, decode_parms = pim.filter_decodeparms[0]
+    if filter_ != Name.FlateDecode:
+        return None
+    predictor = _filter_parameter(decode_parms, Name.Predictor, 1)
+    if predictor is None or predictor < 10:
+        return None  # Not PNG-filtered, so scanlines lack a filter type byte
+
+    colorspace = pim.colorspace
+    if colorspace is None:
+        return None
+    try:
+        color_type, colors = _PNG_COLOR_TYPES[colorspace]
+    except KeyError:
+        return None
+
+    bit_depth = pim.bits_per_component
+    if bit_depth not in _PNG_BIT_DEPTHS[color_type]:
+        return None
+
+    # The predictor was applied to the layout these parameters describe. If they
+    # disagree with the image itself, the stream is not the image's scanlines.
+    if (
+        _filter_parameter(decode_parms, Name.Colors, 1) != colors
+        or _filter_parameter(decode_parms, Name.BitsPerComponent, 8) != bit_depth
+        or _filter_parameter(decode_parms, Name.Columns, 1) != pim.width
+    ):
+        return None
+
+    if Name.Decode in image:
+        return None  # Remapped sample values; PNG has no equivalent
+
+    header = struct_pack(
+        '>IIBBBBB',
+        pim.width,
+        pim.height,
+        bit_depth,
+        color_type,
+        0,  # compression method: deflate, the only one PNG defines
+        0,  # filter method: adaptive, which is what the PDF predictor applied
+        0,  # interlace method: none
+    )
+    return (
+        b'\x89PNG\r\n\x1a\n'
+        + _png_chunk(b'IHDR', header)
+        + _png_chunk(b'IDAT', bytes(image.read_raw_bytes()))
+        + _png_chunk(b'IEND', b'')
+    )
+
+
+def _should_optimize_jpeg(options, filtdp):
+    if options.optimize >= 2:
+        return True
+    # Ghostscript 10.6.x truncates JPEG passthrough data, so at lower optimization
+    # levels we re-encode the JPEG to obtain an intact one, accepting the quality
+    # loss as the lesser evil. Only worth doing when an affected Ghostscript
+    # actually produced this file - other Ghostscript versions, and paths that
+    # bypass Ghostscript entirely, would pay the quality loss for nothing.
+    return ghostscript.jpeg_truncation_bug() and bool(
+        options.extra_attrs.get(ghostscript.GS_GENERATED_PDFA)
+    )
+
+
+def extract_image_generic(
+    *, pdf: Pdf, root: Path, image: Stream, xref: Xref, options
+) -> XrefExt | None:
+    """Generic image extraction."""
+    result = extract_image_filter(image, xref)
+    if result is None:
+        return None
+    pim, filtdp = result
+
+    # Don't try to PNG-optimize 1bpp images, since JBIG2 does it better.
+    # extract_image_jbig2() takes them, including those in an ICC-based
+    # colorspace, whose profile it neutralizes before extracting.
+    if pim.bits_per_component == 1:
+        return None
+
+    if filtdp[0] == Name.DCTDecode:
+        if not _should_optimize_jpeg(options, filtdp):
+            # Leave it alone. Re-encoding a JPEG as a PNG throws away its
+            # compression for no gain, and hands it to the lossy quantization
+            # that transcode_pngs() applies.
+            return None
+        try:
+            imgname = root / f'{xref:08d}'
+            with imgname.open('wb') as f:
+                ext = pim.extract_to(stream=f)
+            imgname.rename(imgname.with_suffix(ext))
+        except (UnsupportedImageTypeError, HifiPrintImageNotTranscodableError):
+            return None
+        return XrefExt(xref, ext)
+    elif (
+        pim.indexed
+        and pim.colorspace in pim.SIMPLE_COLORSPACES
+        and options.optimize >= 3
+    ):
+        # Try to improve on indexed images - these are far from low hanging
+        # fruit in most cases
+        pim.as_pil_image().save(png_name(root, xref))
+        return XrefExt(xref, '.png')
+    elif not pim.indexed and pim.colorspace in pim.SIMPLE_COLORSPACES:
+        png = png_from_flate_predictor(pim, image)
+        if png is not None:
+            png_name(root, xref).write_bytes(png)
+            return XrefExt(xref, '.png')
+        try:
+            pim.as_pil_image().save(png_name(root, xref))
+        except NotImplementedError:
+            log.warning("PDF contains an atypical image that cannot be optimized.")
+            return None
+        return XrefExt(xref, '.png')
+
+    return None
+
+
+def _find_image_xrefs_container(
+    pdf: Pdf,
+    container: Object,
+    pageno: int,
+    include_xrefs: MutableSet[Xref],
+    exclude_xrefs: MutableSet[Xref],
+    pageno_for_xref: dict[Xref, int],
+    depth: int = 0,
+    visited_forms: MutableSet[Xref] | None = None,
+):
+    """Find all image XRefs or Form XObject and add to the include/exclude sets."""
+    # Form XObjects are not added to include/exclude_xrefs, so the dedup
+    # check below doesn't catch Form-XObject cycles or DAGs. Track them in
+    # a shared set so each Form is only descended into once per document
+    # (issue #1321).
+    if visited_forms is None:
+        visited_forms = set()
+    if depth > 10:
+        # With visited_forms memoization, this is a soft DAG-height guard
+        # rather than a cycle defense, so a debug log is sufficient.
+        log.debug("Recursion depth exceeded in _find_image_xrefs_page")
+        return
+    for _imname, image in (container.get_dict(RESOURCES_XOBJECT) or {}).items():
+        if image.objgen[1] != 0:
+            continue  # Ignore images in an incremental PDF
+        xref = Xref(image.objgen[0])
+        if xref in include_xrefs or xref in exclude_xrefs:
+            continue  # Already processed
+        if Name.Subtype in image and image.Subtype == Name.Form:
+            if xref in visited_forms:
+                continue
+            visited_forms.add(xref)
+            log.debug(f"Recursing into Form XObject {_imname} in page {pageno}")
+            _find_image_xrefs_container(
+                pdf,
+                image,
+                pageno,
+                include_xrefs,
+                exclude_xrefs,
+                pageno_for_xref,
+                depth + 1,
+                visited_forms,
+            )
+            continue
+        if Name.SMask in image:
+            # Ignore soft masks
+            smask_xref = Xref(image.SMask.objgen[0])
+            exclude_xrefs.add(smask_xref)
+            log.debug(f"xref {smask_xref}: skipping image because it is an SMask")
+        include_xrefs.add(xref)
+        log.debug(f"xref {xref}: treating as an optimization candidate")
+        if xref not in pageno_for_xref:
+            pageno_for_xref[xref] = pageno
+
+
+def _find_image_xrefs(pdf: Pdf):
+    include_xrefs: MutableSet[Xref] = set()
+    exclude_xrefs: MutableSet[Xref] = set()
+    pageno_for_xref: dict[Xref, int] = {}
+
+    for pageno, page in enumerate(pdf.pages):
+        _find_image_xrefs_container(
+            pdf, page.obj, pageno, include_xrefs, exclude_xrefs, pageno_for_xref
+        )
+
+    working_xrefs = include_xrefs - exclude_xrefs
+    return working_xrefs, pageno_for_xref
+
+
+def extract_images(
+    pdf: Pdf,
+    root: Path,
+    options,
+    extract_fn: Callable[..., XrefExt | None],
+) -> Iterator[tuple[int, XrefExt]]:
+    """Extract image using extract_fn.
+
+    Enumerate images on each page, lookup their xref/ID number in the PDF.
+    Exclude images that are soft masks (i.e. alpha transparency related).
+    Record the page number on which an image is first used, since images may be
+    used on multiple pages (or multiple times on the same page).
+
+    Current we do not check Form XObjects or other objects that may contain
+    images, and we don't evaluate alternate images or thumbnails.
+
+    extract_fn must decide if wants to extract the image in this context. If
+    it does a tuple should be returned: (xref, ext) where .ext is the file
+    extension. extract_fn must also extract the file it finds interesting.
+    """
+    errors = 0
+    working_xrefs, pageno_for_xref = _find_image_xrefs(pdf)
+    for xref in working_xrefs:
+        image = pdf.get_object((xref, 0))
+        try:
+            result = extract_fn(
+                pdf=pdf, root=root, image=image, xref=xref, options=options
+            )
+        except Exception:  # pylint: disable=broad-except
+            # Optimization is best-effort: an image we cannot process is simply
+            # left unchanged in the output, which remains valid. Report this as
+            # a concise warning rather than an alarming traceback (issue #846);
+            # the full detail is still available at debug verbosity.
+            log.warning(
+                f"xref {xref}: this image could not be processed by the "
+                "optimizer and was left unchanged. The output file is still "
+                "valid."
+            )
+            log.debug(f"xref {xref}: image optimization error detail", exc_info=True)
+            errors += 1
+        else:
+            if result:
+                _, ext = result
+                yield pageno_for_xref[xref], XrefExt(xref, ext)
+
+
+def extract_images_generic(
+    pdf: Pdf, root: Path, options
+) -> tuple[list[Xref], list[Xref]]:
+    """Extract any >=2bpp image we think we can improve."""
+    jpegs = []
+    pngs = []
+    for _, xref_ext in extract_images(pdf, root, options, extract_image_generic):
+        log.debug('%s', xref_ext)
+        if xref_ext.ext == '.png':
+            pngs.append(xref_ext.xref)
+        elif xref_ext.ext == '.jpg':
+            jpegs.append(xref_ext.xref)
+    log.debug(f"Optimizable images: JPEGs: {len(jpegs)} PNGs: {len(pngs)}")
+    return jpegs, pngs
+
+
+def extract_images_jbig2(pdf: Pdf, root: Path, options) -> list[XrefExt]:
+    """Extract any bitonal image that we think we can improve as JBIG2."""
+    jbig2_images = []
+    for _pageno, xref_ext in extract_images(pdf, root, options, extract_image_jbig2):
+        jbig2_images.append(xref_ext)
+
+    log.debug(f"Optimizable images: JBIG2: {len(jbig2_images)}")
+    return jbig2_images
+
+
+def _produce_jbig2_images(
+    jbig2_images: list[XrefExt], root: Path, options, executor: Executor
+) -> None:
+    """Produce JBIG2 images using lossless single-image encoding."""
+
+    def jbig2_args():
+        for xref_ext in jbig2_images:
+            xref, ext = xref_ext
+            yield (
+                fspath(root),
+                img_name(root, xref, ext),
+                root / f'{xref:08d}.jbig2',
+                options.jbig2_threshold,
+            )
+
+    executor(
+        use_threads=True,
+        max_workers=options.jobs,
+        progress_kwargs=dict(
+            total=len(jbig2_images),
+            desc="JBIG2",
+            unit='image',
+            disable=not options.progress_bar,
+        ),
+        task=jbig2enc.convert_single,
+        task_arguments=jbig2_args(),
+    )
+
+
+def convert_to_jbig2(
+    pdf: Pdf,
+    jbig2_images: list[XrefExt],
+    root: Path,
+    options,
+    executor: Executor,
+) -> None:
+    """Convert images to JBIG2 and insert into PDF.
+
+    Each JBIG2 image is encoded independently using lossless compression.
+    No symbol dictionary (JBIG2Globals) is used.
+    """
+    _produce_jbig2_images(jbig2_images, root, options, executor)
+
+    for xref_ext in jbig2_images:
+        xref, _ = xref_ext
+        jbig2_im_file = root / f'{xref:08d}.jbig2'
+        jbig2_im_data = jbig2_im_file.read_bytes()
+        im_obj = pdf.get_object(xref, 0)
+        im_obj.write(jbig2_im_data, filter=Name.JBIG2Decode, decode_parms=None)
+
+
+def _optimize_jpeg(
+    xref: Xref, in_jpg: Path, opt_jpg: Path, jpeg_quality: int
+) -> tuple[Xref, Path | None]:
+    with Image.open(in_jpg) as im:
+        save_kwargs: dict[str, Any] = {'optimize': True}
+        if isinstance(jpeg_quality, int) and 0 < jpeg_quality <= 100:
+            save_kwargs['quality'] = jpeg_quality
+        im.save(opt_jpg, **save_kwargs)
+
+    if opt_jpg.stat().st_size > in_jpg.stat().st_size:
+        log.debug(f"xref {xref}, jpeg, made larger - skip")
+        opt_jpg.unlink()
+        return xref, None
+    return xref, opt_jpg
+
+
+def transcode_jpegs(
+    pdf: Pdf, jpegs: Sequence[Xref], root: Path, options, executor: Executor
+) -> None:
+    """Optimize JPEGs according to optimization settings."""
+
+    def jpeg_args() -> Iterator[tuple[Xref, Path, Path, int]]:
+        for xref in jpegs:
+            in_jpg = jpg_name(root, xref)
+            opt_jpg = in_jpg.with_suffix('.opt.jpg')
+            yield xref, in_jpg, opt_jpg, options.jpeg_quality
+
+    def finish_jpeg(result: tuple[Xref, Path | None], pbar: ProgressBar):
+        xref, opt_jpg = result
+        if opt_jpg:
+            compdata = opt_jpg.read_bytes()  # JPEG can inserted into PDF as is
+            im_obj = pdf.get_object(xref, 0)
+            im_obj.write(compdata, filter=Name.DCTDecode)
+        pbar.update()
+
+    executor(
+        use_threads=True,  # Processes are significantly slower at this task
+        max_workers=options.jobs,
+        progress_kwargs=dict(
+            desc="Recompressing JPEGs",
+            total=len(jpegs),
+            unit='image',
+            disable=not options.progress_bar,
+        ),
+        task=_optimize_jpeg,
+        task_arguments=jpeg_args(),
+        task_finished=finish_jpeg,
+    )
+
+
+def _already_flate_encoded(image: Stream) -> bool:
+    """Check if the image already has FlateDecode in its filter chain."""
+    filt = image.get(Name.Filter)
+    if filt is None:
+        return False
+    if isinstance(filt, Array):
+        return Name.FlateDecode in list(filt)
+    return filt == Name.FlateDecode
+
+
+def _find_deflatable_jpeg(
+    *, pdf: Pdf, root: Path, image: Stream, xref: Xref, options
+) -> XrefExt | None:
+    result = extract_image_filter(image, xref)
+    if result is None:
+        return None
+    _pim, filtdp = result
+
+    # Skip if already FlateDecode compressed - would double-compress
+    if _already_flate_encoded(image):
+        return None
+
+    if (
+        filtdp[0] == Name.DCTDecode
+        and not filtdp[1]
+        and (
+            (
+                # Don't flate very large images because it will slow down PDF viewers
+                1 <= options.optimize <= 2
+                and image.get_int(Name.Width, 0, coerce=True) < FLATE_JPEG_THRESHOLD
+                and image.get_int(Name.Height, 0, coerce=True) < FLATE_JPEG_THRESHOLD
+            )
+            or options.optimize == 3
+        )
+    ):
+        return XrefExt(xref, '.memory')
+
+    return None
+
+
+def _deflate_jpeg(
+    pdf: Pdf, lock: threading.Lock, xref: Xref, complevel: int
+) -> tuple[Xref, bytes]:
+    with lock:
+        xobj = pdf.get_object(xref, 0)
+        try:
+            data = xobj.read_raw_bytes()
+        except PdfError:
+            return xref, b''
+    compdata = compress(data, complevel)
+    if len(compdata) >= len(data):
+        return xref, b''
+    return xref, compdata
+
+
+def deflate_jpegs(pdf: Pdf, root: Path, options, executor: Executor) -> None:
+    """Apply FlateDecode to JPEGs.
+
+    This is a lossless compression method that is supported by all PDF viewers,
+    and generally results in a smaller file size compared to straight DCTDecode
+    images.
+    """
+    jpegs = []
+    for _pageno, xref_ext in extract_images(pdf, root, options, _find_deflatable_jpeg):
+        xref = xref_ext.xref
+        log.debug(f'xref {xref}: marking this JPEG as deflatable')
+        jpegs.append(xref)
+
+    complevel = 9 if options.optimize == 3 else 6
+
+    # Our calls to xobj.write() in finish() need coordination
+    lock = threading.Lock()
+
+    def deflate_args() -> Iterator:
+        for xref in jpegs:
+            yield pdf, lock, xref, complevel
+
+    def finish(result: tuple[Xref, bytes], pbar: ProgressBar):
+        xref, compdata = result
+        if len(compdata) > 0:
+            with lock:
+                xobj = pdf.get_object(xref, 0)
+                xobj.write(compdata, filter=[Name.FlateDecode, Name.DCTDecode])
+        pbar.update()
+
+    executor(
+        use_threads=True,  # We're sharing the pdf directly, must use threads
+        max_workers=options.jobs,
+        progress_kwargs=dict(
+            desc="Deflating JPEGs",
+            total=len(jpegs),
+            unit='image',
+            disable=not options.progress_bar,
+        ),
+        task=_deflate_jpeg,
+        task_arguments=deflate_args(),
+        task_finished=finish,
+    )
+
+
+def _transcode_png(pdf: Pdf, filename: Path, xref: Xref) -> bool:
+    output = filename.with_suffix('.png.pdf')
+    with output.open('wb') as f:
+        img2pdf.convert(fspath(filename), outputstream=f, **IMG2PDF_KWARGS)
+
+    with Pdf.open(output, conversion_mode='explicit') as pdf_image:
+        foreign_image = next(iter(pdf_image.pages[0].get_images().values()))
+        local_image = pdf.copy_foreign(foreign_image)
+
+        im_obj = pdf.get_object(xref, 0)
+        # pikepdf's Object attribute access can't statically know Filter/
+        # DecodeParms hold these specific subtypes, but a copied image's
+        # stream dictionary always does per the PDF spec.
+        im_obj.write(
+            local_image.read_raw_bytes(),
+            filter=cast('Name | Array | list[Name] | None', local_image.Filter),
+            decode_parms=cast('Dictionary | Array | None', local_image.DecodeParms),
+        )
+
+        # Don't copy keys from the new image...
+        del_keys = set(im_obj.keys()) - set(local_image.keys())
+        # ...except for the keep_fields, which are essential to displaying
+        # the image correctly and preserving its metadata. (/Decode arrays
+        # and /SMaskInData are implicitly discarded prior to this point.)
+        keep_fields = {
+            '/ID',
+            '/Intent',
+            '/Interpolate',
+            '/Mask',
+            '/Metadata',
+            '/OC',
+            '/OPI',
+            '/SMask',
+            '/StructParent',
+        }
+        del_keys -= keep_fields
+        for key in local_image.keys():
+            if key != Name.Length and str(key) not in keep_fields:
+                im_obj[key] = local_image[key]
+        for key in del_keys:
+            del im_obj[key]
+    return True
+
+
+def transcode_pngs(
+    pdf: Pdf,
+    images: Sequence[Xref],
+    image_name_fn: Callable[[Path, Xref], Path],
+    root: Path,
+    options,
+    executor: Executor,
+) -> None:
+    """Apply lossy transcoding to PNGs."""
+    modified: MutableSet[Xref] = set()
+    if options.optimize >= 2:
+        png_quality = (
+            max(10, options.png_quality - 10),
+            min(100, options.png_quality + 10),
+        )
+
+        def pngquant_args():
+            for xref in images:
+                log.debug(image_name_fn(root, xref))
+                yield (
+                    image_name_fn(root, xref),
+                    png_name(root, xref),
+                    png_quality[0],
+                    png_quality[1],
+                )
+                modified.add(xref)
+
+        executor(
+            use_threads=True,
+            max_workers=options.jobs,
+            progress_kwargs=dict(
+                desc="PNGs",
+                total=len(images),
+                unit='image',
+                disable=not options.progress_bar,
+            ),
+            task=pngquant.quantize,
+            task_arguments=pngquant_args(),
+        )
+
+    for xref in modified:
+        filename = png_name(root, xref)
+        _transcode_png(pdf, filename, xref)
+
+
+DEFAULT_EXECUTOR = SerialExecutor()
+
+
+def optimize(
+    input_file: Path,
+    output_file: Path,
+    context: PdfContext,
+    save_settings: dict[str, Any],
+    executor: Executor = DEFAULT_EXECUTOR,
+) -> Path:
+    """Optimize images in a PDF file.
+
+    Recodes image data only. Ordinary stream compression is left to the
+    ``pdf.save(**save_settings)`` call at the end of this function, which the
+    module docstring describes.
+    """
+    options = context.options
+    if options.optimize == 0:
+        safe_symlink(input_file, output_file)
+        return output_file
+
+    if not options.jpeg_quality:
+        options.jpeg_quality = DEFAULT_JPEG_QUALITY if options.optimize < 3 else 40
+    if not options.png_quality:
+        options.png_quality = DEFAULT_PNG_QUALITY if options.optimize < 3 else 30
+
+    with Pdf.open(input_file, conversion_mode='explicit') as pdf:
+        root = output_file.parent / 'images'
+        root.mkdir(exist_ok=True)
+
+        jpegs, pngs = extract_images_generic(pdf, root, options)
+        transcode_jpegs(pdf, jpegs, root, options, executor)
+        deflate_jpegs(pdf, root, options, executor)
+        # if options.optimize >= 2:
+        # Try pngifying the jpegs
+        #    transcode_pngs(pdf, jpegs, jpg_name, root, options)
+        transcode_pngs(pdf, pngs, png_name, root, options, executor)
+
+        jbig2_images = extract_images_jbig2(pdf, root, options)
+        convert_to_jbig2(pdf, jbig2_images, root, options, executor)
+
+        target_file = output_file.with_suffix('.opt.pdf')
+        pdf.remove_unreferenced_resources()
+        pdf.save(target_file, **save_settings)
+
+    input_size = input_file.stat().st_size
+    output_size = target_file.stat().st_size
+    if output_size == 0:
+        raise OutputFileAccessError(
+            f"Output file not created after optimizing. We probably ran "
+            f"out of disk space in the temporary folder: {tempfile.gettempdir()}."
+        )
+    savings = 1 - output_size / input_size
+
+    if savings < 0:
+        log.info(
+            "Image optimization did not improve the file - "
+            "optimizations will not be used"
+        )
+        # We still need to save the file
+        with Pdf.open(input_file, conversion_mode='explicit') as pdf:
+            pdf.remove_unreferenced_resources()
+            pdf.save(output_file, **save_settings)
+    else:
+        safe_symlink(target_file, output_file)
+
+    return output_file
+
+
+def main(infile, outfile, level, jobs=1):
+    """Entry point for direct optimization of a file."""
+    from shutil import copy  # pylint: disable=import-outside-toplevel
+    from tempfile import TemporaryDirectory  # pylint: disable=import-outside-toplevel
+
+    from ocrmypdf._options import OcrOptions  # pylint: disable=import-outside-toplevel
+
+    infile = Path(infile)
+
+    # Create OcrOptions with optimization-specific settings
+    options = OcrOptions(
+        input_file=infile,
+        output_file=outfile,  # Required field
+        jobs=jobs,
+        optimize=int(level),
+        jpeg_quality=0,  # Use default
+        png_quality=0,
+        jbig2_threshold=0.85,
+        quiet=True,
+        progress_bar=False,
+    )
+
+    with TemporaryDirectory() as tmpdir:
+        # optimize() only reads context.options on this standalone path, so
+        # pdfinfo and plugin_manager are not needed.
+        context = PdfContext(options, Path(tmpdir), infile, None, None)  # type: ignore[arg-type]
+        tmpout = Path(tmpdir) / 'out.pdf'
+        optimize(
+            infile,
+            tmpout,
+            context,
+            dict(
+                compress_streams=True,
+                preserve_pdfa=True,
+                object_stream_mode=ObjectStreamMode.generate,
+            ),
+        )
+        copy(fspath(tmpout), fspath(outfile))
+
+
+if __name__ == '__main__':
+    main(sys.argv[1], sys.argv[2], sys.argv[3])
